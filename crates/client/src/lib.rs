@@ -356,6 +356,65 @@ fn encode(s: &str) -> String {
     out
 }
 
+/// One hit of a search across indexes: which index it came from, its rank
+/// there, and the fused score it was ordered by.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct FederatedHit {
+    pub index: String,
+    pub rank: usize,
+    pub score: f64,
+    pub hit: Hit,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Federated {
+    /// Matches per index (each index's own total).
+    pub totals: Vec<(String, usize)>,
+    pub hits: Vec<FederatedHit>,
+}
+
+/// Reciprocal rank fusion's constant: a hit at rank `r` (from 0) scores
+/// `1 / (K + r + 1)`. Ranks, not scores, are combined: BM25 scores from
+/// different indexes aren't comparable.
+const RRF_K: f64 = 60.0;
+
+/// Search several indexes with one query (in parallel) and merge the hits by
+/// reciprocal rank fusion: the first hits of every index come first,
+/// interleaved, whatever their raw scores. `q.limit` applies per index and
+/// to the merged list.
+pub fn search_all(indexes: &[&Index], q: &SearchQuery) -> Result<Federated> {
+    let results: Vec<Result<SearchResult>> = std::thread::scope(|s| {
+        let hs: Vec<_> = indexes.iter().map(|ix| s.spawn(move || ix.search(q))).collect();
+        hs.into_iter()
+            .map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("search thread panicked"))))
+            .collect()
+    });
+    let mut totals = vec![];
+    let mut hits = vec![];
+    for (ix, r) in indexes.iter().zip(results) {
+        let r = r?;
+        totals.push((ix.name().to_string(), r.total));
+        for (rank, hit) in r.hits.into_iter().enumerate() {
+            hits.push(FederatedHit {
+                index: ix.name().to_string(),
+                rank,
+                score: 1.0 / (RRF_K + rank as f64 + 1.0),
+                hit,
+            });
+        }
+    }
+    // Same fused score (same rank): the index with more matches first.
+    let total_of = |n: &str| totals.iter().find(|(x, _)| x == n).map_or(0, |t| t.1);
+    hits.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(total_of(&b.index).cmp(&total_of(&a.index)))
+            .then(a.index.cmp(&b.index))
+    });
+    hits.truncate(q.limit.max(1));
+    Ok(Federated { totals, hits })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
