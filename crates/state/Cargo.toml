@@ -1,0 +1,23 @@
+[package]
+name = "strata-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable pipeline state: a storage trait (local folder, S3/R2), content-addressed blobs, chunked files, packed directories and a conditionally written HEAD"
+
+[dependencies]
+tracing = { workspace = true }
+anyhow.workspace = true
+async-trait = "=0.1.92"
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zstd.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]

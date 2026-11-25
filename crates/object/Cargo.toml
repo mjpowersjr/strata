@@ -1,0 +1,13 @@
+[package]
+name = "strata-object"
+description = "Stored form of a published object: an encoding byte, then the payload; named by the SHA-256 of the decoded bytes"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sha2.workspace = true
+hex.workspace = true
+zstd.workspace = true
+thiserror.workspace = true

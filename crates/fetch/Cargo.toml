@@ -1,0 +1,15 @@
+[package]
+name = "strata-fetch"
+description = "Verified, cached content-addressed objects over HTTP"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+strata-object.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = "3"

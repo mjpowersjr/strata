@@ -1,0 +1,16 @@
+[package]
+name = "strata-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The entry point for an app reading published indexes: online or from an offline copy, pin and sync, search, rows and typed records"
+
+[dependencies]
+strata.workspace = true
+strata-fetch.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

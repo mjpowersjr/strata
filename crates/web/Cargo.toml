@@ -1,0 +1,30 @@
+[package]
+name = "strata-web"
+description = "The reader in a browser (wasm32): search and lookups over fetched, verified objects"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+strata-core.workspace = true
+strata-object.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+futures.workspace = true
+async-trait = "=0.1.92"
+tantivy = { version = "=0.27.0", default-features = false, features = ["lz4-compression", "stopwords", "stemmer", "quickwit"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "=0.2.130"
+wasm-bindgen-futures = "=0.4.80"
+js-sys = "=0.3.107"
+getrandom = { version = "0.3", features = ["wasm_js"] }
+uuid = { version = "1", features = ["js"] }
