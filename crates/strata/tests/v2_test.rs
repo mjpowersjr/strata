@@ -58,7 +58,7 @@ fn profile() -> Profile {
     Profile {
         index: "things",
         profile: "test",
-        audio_base: "https://example.invalid/",
+        files_base: "https://example.invalid/",
         attribution: vec![],
         tables: vec!["things"],
         extra_indexes: vec![],

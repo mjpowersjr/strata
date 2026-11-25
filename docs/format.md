@@ -86,7 +86,7 @@ A JSON object in `objects/`, describing one complete version:
   "seq": 330970,
   "previous": { "sha256": "…" },
   "profile": "otr",
-  "audio_base": "https://archive.org/download/",
+  "files_base": "https://archive.org/download/",
   "attribution": [ … ],
   "search": {
     "engine": "tantivy-0.27-sstable",

@@ -68,7 +68,8 @@ pub enum TableSync {
 pub struct Profile {
     pub index: &'static str,
     pub profile: &'static str,
-    pub audio_base: &'static str,
+    /// Base URL the rows' files are relative to (`Version::files_base`).
+    pub files_base: &'static str,
     pub attribution: Vec<String>,
     pub tables: Vec<&'static str>,
     pub extra_indexes: Vec<ExtraIndex>,

@@ -13,7 +13,7 @@
 //!   facets, rows by key ([`Index::get`]), key ranges ([`Index::range`]), and
 //!   the item record as published ([`Index::record`]).
 //!
-//! Files the rows refer to stay where the index says (its `audio_base`);
+//! Files the rows refer to stay where the index says (its `files_base`);
 //! downloading them is the app's job.
 //!
 //! Every call blocks (the reader fetches with a blocking HTTP client); call
@@ -110,7 +110,7 @@ pub struct Library {
 pub struct Index {
     ix: V2Index,
     origin: Origin,
-    audio_base: String,
+    files_base: String,
 }
 
 impl Library {
@@ -265,11 +265,11 @@ fn is_network(e: &anyhow::Error) -> bool {
 impl Index {
     fn new(ix: V2Index, origin: Origin) -> Self {
         // The version says where its audio lives; no collection knowledge here.
-        let audio_base = ix.version.audio_base.clone();
+        let files_base = ix.version.files_base.clone();
         Self {
             ix,
             origin,
-            audio_base,
+            files_base,
         }
     }
 
@@ -332,11 +332,11 @@ impl Index {
         }
     }
 
-    /// Where a file of an item plays from (the profile's `audio_base`).
+    /// Where a file of an item plays from (the index's `files_base`).
     pub fn file_url(&self, item: &str, file: &str) -> String {
         format!(
             "{}{}/{}",
-            self.audio_base,
+            self.files_base,
             encode(item),
             file.split('/').map(encode).collect::<Vec<_>>().join("/")
         )

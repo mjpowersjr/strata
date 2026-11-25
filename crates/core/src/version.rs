@@ -5,9 +5,10 @@ pub use crate::ObjRef;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// 3.1: the version's `audio_base` is `files_base` (3.0 versions still read).
 /// 3.0: objects are named by the sha256 of their decoded bytes and stored
 /// with an encoding byte (`strata_object`); the tree moved to `v3/`.
-pub const SPEC_VERSION: &str = "3.0.0";
+pub const SPEC_VERSION: &str = "3.1.0";
 /// `Manifest::format`.
 pub const FORMAT: &str = "v3";
 /// The published tree's prefix under the public base: `{TREE}/objects/{sha}`,
@@ -38,7 +39,9 @@ pub struct Version {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub previous: Option<ObjRef>,
     pub profile: String,
-    pub audio_base: String,
+    /// Base URL the rows' files are relative to (3.0 called it `audio_base`).
+    #[serde(alias = "audio_base")]
+    pub files_base: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attribution: Vec<String>,
     pub search: SearchRef,
@@ -69,4 +72,28 @@ pub struct MapRef {
 pub struct StoreRef {
     pub node_target: usize,
     pub maps: BTreeMap<String, MapRef>,
+}
+
+#[cfg(test)]
+mod files_base_tests {
+    use super::*;
+
+    #[test]
+    fn a_3_0_version_with_audio_base_still_reads() {
+        let mut v = serde_json::json!({
+            "index": "x", "seq": 1, "profile": "p",
+            "files_base": "https://f/",
+            "search": {"engine": "e", "fields": [], "chunk_size": 1, "files": {}, "segments": []},
+            "store": {"node_target": 16384, "maps": {}},
+            "records": 0
+        });
+        let new: Version = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(new.files_base, "https://f/");
+        let o = v.as_object_mut().unwrap();
+        let b = o.remove("files_base").unwrap();
+        o.insert("audio_base".into(), b);
+        let old: Version = serde_json::from_value(v).unwrap();
+        assert_eq!(old.files_base, "https://f/");
+        assert!(serde_json::to_string(&old).unwrap().contains("\"files_base\""));
+    }
 }

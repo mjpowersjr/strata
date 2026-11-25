@@ -624,7 +624,7 @@ mod wasm {
             serde_json::to_string(&self.inner.stats()).unwrap_or_default()
         }
 
-        /// The open version: manifest, profile, `audio_base`, attribution,
+        /// The open version: manifest, profile, `files_base`, attribution,
         /// record count and each store map's row count (JSON).
         pub fn info(&self) -> String {
             let v = self.inner.version();
@@ -633,7 +633,7 @@ mod wasm {
             serde_json::json!({
                 "manifest": self.inner.manifest,
                 "profile": v.profile,
-                "audio_base": v.audio_base,
+                "files_base": v.files_base,
                 "attribution": v.attribution,
                 "records": v.records,
                 "counts": counts,
