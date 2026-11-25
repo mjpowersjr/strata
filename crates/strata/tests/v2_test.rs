@@ -63,7 +63,6 @@ fn profile() -> Profile {
         tables: vec!["things"],
         extra_indexes: vec![],
         views: vec![],
-        sync: vec![],
         search: SearchSpec {
             sql: "SELECT id AS grp, id, name, kind, year FROM things WHERE {WHERE} ORDER BY id",
             group_column: "id",

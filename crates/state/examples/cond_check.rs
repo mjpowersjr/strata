@@ -1,6 +1,6 @@
 //! `cond_check <store-url>`: do the store's conditional writes behave
 //! (create-if-absent, replace-if-match, refuse a stale ETag)?
-use strata_state::{store, Cond, Put, PutOpts};
+use strata_state::{store, Cond, PutOpts};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
