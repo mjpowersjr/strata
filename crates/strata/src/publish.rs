@@ -227,7 +227,7 @@ pub fn publish_with(
         spec_version: SPEC_VERSION.into(),
         index: p.index.into(),
         seq,
-        built_at: chrono_now(),
+        built_at: now_utc(),
         version: vref.clone(),
     };
     let mdir = tree.join(p.index);
@@ -252,6 +252,6 @@ pub fn publish_with(
     Ok(rep)
 }
 
-fn chrono_now() -> String {
-    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+fn now_utc() -> String {
+    jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }

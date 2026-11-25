@@ -294,7 +294,7 @@ impl S3Store {
     ) -> Result<reqwest::Response> {
         let mut last = None;
         for attempt in 0..5u64 {
-            let now = chrono::Utc::now();
+            let now = jiff::Timestamp::now();
             let signed = sign_v4(&SignInput {
                 method,
                 host: &self.host,
@@ -305,7 +305,7 @@ impl S3Store {
                 access: &self.access,
                 secret: &self.secret,
                 region: &self.region,
-                amz_date: &now.format("%Y%m%dT%H%M%SZ").to_string(),
+                amz_date: &now.strftime("%Y%m%dT%H%M%SZ").to_string(),
             });
             let qs = canonical_query(query);
             let url = if qs.is_empty() {

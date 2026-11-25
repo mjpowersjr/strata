@@ -746,8 +746,8 @@ const GC_KEY: &str = "gc/candidates.json";
 pub async fn gc(
     store: &dyn Store,
     keep: usize,
-    grace: chrono::Duration,
-    now: chrono::DateTime<chrono::Utc>,
+    grace: jiff::SignedDuration,
+    now: jiff::Timestamp,
     dry_run: bool,
 ) -> Result<GcReport> {
     let mut rep = GcReport {
@@ -799,8 +799,8 @@ pub async fn gc(
     for b in blobs.iter().filter(|b| !referenced.contains(*b)) {
         match old.get(b) {
             Some(t) => {
-                let seen = chrono::DateTime::parse_from_rfc3339(t)?.with_timezone(&chrono::Utc);
-                if now - seen >= grace {
+                let seen: jiff::Timestamp = t.parse()?;
+                if now.duration_since(seen) >= grace {
                     delete.push(b.clone());
                 } else {
                     next.insert(b.clone(), t.clone());
@@ -810,7 +810,7 @@ pub async fn gc(
                 rep.new_candidates += 1;
                 next.insert(
                     b.clone(),
-                    now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    now.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
                 );
             }
         }
@@ -873,15 +873,15 @@ mod gc_tests {
             .into(),
         };
         assert!(commit(&*store, &head, None).await.unwrap());
-        let t0 = chrono::Utc::now();
-        let g = chrono::Duration::hours(24);
+        let t0 = jiff::Timestamp::now();
+        let g = jiff::SignedDuration::from_hours(24);
         let r = gc(&*store, 3, g, t0, false).await.unwrap();
         assert_eq!((r.new_candidates, r.deleted), (1, 0));
-        let r = gc(&*store, 3, g, t0 + chrono::Duration::hours(1), false)
+        let r = gc(&*store, 3, g, t0 + jiff::SignedDuration::from_hours(1), false)
             .await
             .unwrap();
         assert_eq!((r.new_candidates, r.deleted), (0, 0));
-        let r = gc(&*store, 3, g, t0 + chrono::Duration::hours(25), false)
+        let r = gc(&*store, 3, g, t0 + jiff::SignedDuration::from_hours(25), false)
             .await
             .unwrap();
         assert_eq!(r.deleted, 1);
