@@ -289,3 +289,33 @@ fn fallback_source_and_membership() {
     assert_eq!(phone.plan_keep(&pix).unwrap().missing, 0);
     assert_eq!(pix.range_iter("things", &[], false, 1000).collect::<anyhow::Result<Vec<_>>>().unwrap().len() as i64, N);
 }
+
+fn dir_bytes(p: &Path) -> u64 {
+    let mut n = 0;
+    if let Ok(rd) = std::fs::read_dir(p) {
+        for e in rd.flatten() {
+            let m = e.metadata().unwrap();
+            n += if m.is_dir() { dir_bytes(&e.path()) } else { m.len() };
+        }
+    }
+    n
+}
+
+#[test]
+fn bytes_fetched_match_what_was_written() {
+    let w = World::new();
+    let root = w.dir.path().join("count");
+    let lib = w.lib("count");
+    let ix = lib.index("things").unwrap();
+    // Listing reads the internal tree nodes (as a plan does); not counted.
+    lib.plan_keep(&ix).unwrap();
+    let before = dir_bytes(&root.join("cache"));
+    let last = Arc::new(Mutex::new(0u64));
+    let l2 = last.clone();
+    let r = lib
+        .keep_offline_with(&ix, &Control::new().on_progress(move |p| *l2.lock().unwrap() = p.downloaded))
+        .unwrap();
+    let written = dir_bytes(&root.join("cache")) - before;
+    assert_eq!(r.bytes_fetched, written);
+    assert_eq!(*last.lock().unwrap(), written);
+}

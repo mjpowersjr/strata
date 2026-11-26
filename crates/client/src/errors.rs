@@ -7,13 +7,16 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorKind {
-    /// No connection (or, for an offline open, nothing saved to open).
+    /// No connection, or it closed or reset before any answer (or, for an
+    /// offline open, nothing saved to open).
     Offline,
     /// The server answered with this HTTP status (404/410: gone; 5xx: try
     /// later).
     Status(u16),
     /// The response ended early.
     Truncated,
+    /// The answer wasn't HTTP (something else listens there).
+    Protocol,
     /// No complete answer in time.
     Timeout,
     /// An object didn't match its name (discarded, not cached).
@@ -58,6 +61,7 @@ fn kind_of(r: &RemoteError) -> ErrorKind {
             status: Some(s), ..
         } => ErrorKind::Status(*s),
         RemoteError::Truncated { .. } => ErrorKind::Truncated,
+        RemoteError::Protocol { .. } => ErrorKind::Protocol,
         RemoteError::Timeout { .. } => ErrorKind::Timeout,
         RemoteError::Integrity { .. } => ErrorKind::Integrity,
         RemoteError::SpecUnsupported(_) | RemoteError::SchemaTooNew { .. } => ErrorKind::Unsupported,

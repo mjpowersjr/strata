@@ -26,7 +26,8 @@ pub struct Plan {
 /// A download's progress over the objects it has to fetch (not those
 /// already cached). `bytes_*` are in [`Plan`] units (decoded, estimated for
 /// nodes), so `bytes_done / bytes_total` is a fraction; `downloaded` is the
-/// bytes actually received.
+/// bytes actually received for those objects (each counted once; not the
+/// internal tree nodes read to list them, which a [`Plan`] reads too).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Progress {
     pub objects_done: usize,

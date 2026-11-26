@@ -628,6 +628,7 @@ fn is_network(e: &anyhow::Error) -> bool {
                 | Some(RemoteError::Status { .. })
                 | Some(RemoteError::Truncated { .. })
                 | Some(RemoteError::Timeout { .. })
+                | Some(RemoteError::Protocol { .. })
         )
     })
 }
