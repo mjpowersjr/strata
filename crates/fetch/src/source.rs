@@ -98,20 +98,19 @@ impl HttpSource {
             match self.client.get(url).send() {
                 Ok(r) if r.status().is_success() => match r.bytes() {
                     Ok(b) => return Ok(b.to_vec()),
+                    Err(e) if e.is_timeout() => last = Some(RemoteError::Timeout { url: url.into() }),
                     Err(e) => {
-                        last = Some(RemoteError::Fetch {
+                        last = Some(RemoteError::Truncated {
                             url: url.into(),
-                            status: None,
                             detail: e.to_string(),
                         })
                     }
                 },
                 Ok(r) => {
                     let s = r.status().as_u16();
-                    last = Some(RemoteError::Fetch {
+                    last = Some(RemoteError::Status {
                         url: url.into(),
-                        status: Some(s),
-                        detail: String::new(),
+                        status: s,
                     });
                     if (400..500).contains(&s) && s != 429 {
                         break;
@@ -119,6 +118,9 @@ impl HttpSource {
                 }
                 Err(e) if e.is_connect() => {
                     last = Some(RemoteError::Offline { what: url.into() });
+                }
+                Err(e) if e.is_timeout() => {
+                    last = Some(RemoteError::Timeout { url: url.into() });
                 }
                 Err(e) => {
                     last = Some(RemoteError::Fetch {
@@ -145,5 +147,79 @@ impl ChunkSource for HttpSource {
     }
     fn fetch_path(&self, path: &str) -> Result<Vec<u8>, RemoteError> {
         self.get(&format!("{}{path}", self.base))
+    }
+}
+
+/// Several sources tried in order, e.g. a computer on the home network
+/// first and the public tree second. An object is taken from the first
+/// source whose bytes verify against its name (a source serving something
+/// else, stale or corrupt, is skipped); the cache verifies again. Paths
+/// (`manifest.json`) come from the first source that answers.
+pub struct FallbackSource {
+    sources: Vec<std::sync::Arc<dyn ChunkSource>>,
+}
+
+impl FallbackSource {
+    pub fn new(sources: Vec<std::sync::Arc<dyn ChunkSource>>) -> Self {
+        assert!(!sources.is_empty(), "FallbackSource needs a source");
+        Self { sources }
+    }
+}
+
+impl ChunkSource for FallbackSource {
+    fn fetch(&self, sha256: &str, size: u64) -> Result<Vec<u8>, RemoteError> {
+        let mut last = None;
+        for s in &self.sources {
+            match s.fetch(sha256, size) {
+                Ok(b) if strata_object::decode_verified(&b, sha256, size).is_ok() => return Ok(b),
+                Ok(_) => {
+                    last = Some(RemoteError::Integrity {
+                        chunk: sha256.into(),
+                    })
+                }
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap())
+    }
+    fn fetch_path(&self, path: &str) -> Result<Vec<u8>, RemoteError> {
+        let mut last = None;
+        for s in &self.sources {
+            match s.fetch_path(path) {
+                Ok(b) => return Ok(b),
+                Err(e) => last = Some(e),
+            }
+        }
+        Err(last.unwrap())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    struct Fixed(Result<Vec<u8>, RemoteError>);
+    impl ChunkSource for Fixed {
+        fn fetch(&self, _: &str, _: u64) -> Result<Vec<u8>, RemoteError> {
+            self.0.clone()
+        }
+        fn fetch_path(&self, _: &str) -> Result<Vec<u8>, RemoteError> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn fallback_takes_the_first_source_that_verifies() {
+        let good = strata_object::encode(b"hello", strata_object::Codec::Raw);
+        let name = strata_object::name(b"hello");
+        let off = Arc::new(Fixed(Err(RemoteError::Offline { what: "home".into() })));
+        let wrong = Arc::new(Fixed(Ok(strata_object::encode(b"other", strata_object::Codec::Raw))));
+        let right = Arc::new(Fixed(Ok(good.clone())));
+        let f = FallbackSource::new(vec![off.clone(), wrong.clone(), right]);
+        assert_eq!(f.fetch(&name, 5).unwrap(), good);
+        assert_eq!(f.fetch_path("x/manifest.json").unwrap(), strata_object::encode(b"other", strata_object::Codec::Raw));
+        let none = FallbackSource::new(vec![off, wrong]);
+        assert!(matches!(none.fetch(&name, 5), Err(RemoteError::Integrity { .. })));
     }
 }

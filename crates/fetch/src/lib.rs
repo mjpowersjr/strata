@@ -12,13 +12,24 @@ pub mod source;
 pub mod testing;
 
 pub use cache::{CacheStats, ChunkCache};
-pub use source::{ChunkSource, HttpSource};
+pub use source::{ChunkSource, FallbackSource, HttpSource};
 
 /// Why a remote read failed (section 5.7).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteError {
     #[error("not available offline: {what}")]
     Offline { what: String },
+    /// The server answered with a status other than success (after retries
+    /// for 5xx and 429).
+    #[error("fetch {url}: HTTP {status}")]
+    Status { url: String, status: u16 },
+    /// The response body ended early or its read failed part way.
+    #[error("fetch {url} cut short: {detail}")]
+    Truncated { url: String, detail: String },
+    /// No complete answer within the request timeout.
+    #[error("fetch {url} timed out")]
+    Timeout { url: String },
+    /// Any other failure (TLS, a malformed response, a client error).
     #[error("fetch {url} failed{}: {detail}", status.map(|s| format!(" ({s})")).unwrap_or_default())]
     Fetch {
         url: String,
