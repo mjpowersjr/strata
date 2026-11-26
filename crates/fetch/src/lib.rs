@@ -17,6 +17,7 @@ pub use source::{ChunkSource, FallbackSource, HttpSource};
 /// Why a remote read failed (section 5.7).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum RemoteError {
+    /// No connection, or it closed or reset before any answer.
     #[error("not available offline: {what}")]
     Offline { what: String },
     /// The server answered with a status other than success (after retries
@@ -29,7 +30,11 @@ pub enum RemoteError {
     /// No complete answer within the request timeout.
     #[error("fetch {url} timed out")]
     Timeout { url: String },
-    /// Any other failure (TLS, a malformed response, a client error).
+    /// The answer wasn't HTTP (something else listens there, or a broken
+    /// proxy).
+    #[error("fetch {url}: not an HTTP answer: {detail}")]
+    Protocol { url: String, detail: String },
+    /// Any other failure (TLS, a client error).
     #[error("fetch {url} failed{}: {detail}", status.map(|s| format!(" ({s})")).unwrap_or_default())]
     Fetch {
         url: String,

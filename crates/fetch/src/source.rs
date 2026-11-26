@@ -99,10 +99,11 @@ impl HttpSource {
                 Ok(r) if r.status().is_success() => match r.bytes() {
                     Ok(b) => return Ok(b.to_vec()),
                     Err(e) if e.is_timeout() => last = Some(RemoteError::Timeout { url: url.into() }),
+                    // The answer had started: whatever broke, it was cut short.
                     Err(e) => {
                         last = Some(RemoteError::Truncated {
                             url: url.into(),
-                            detail: e.to_string(),
+                            detail: chain(&e),
                         })
                     }
                 },
@@ -116,23 +117,72 @@ impl HttpSource {
                         break;
                     }
                 }
-                Err(e) if e.is_connect() => {
-                    last = Some(RemoteError::Offline { what: url.into() });
-                }
-                Err(e) if e.is_timeout() => {
-                    last = Some(RemoteError::Timeout { url: url.into() });
-                }
-                Err(e) => {
-                    last = Some(RemoteError::Fetch {
-                        url: url.into(),
-                        status: None,
-                        detail: e.to_string(),
-                    })
-                }
+                Err(e) => last = Some(classify(url, &e)),
             }
         }
         Err(last.unwrap())
     }
+}
+
+/// A request that failed before any answer.
+fn classify(url: &str, e: &reqwest::Error) -> RemoteError {
+    if e.is_timeout() {
+        return RemoteError::Timeout { url: url.into() };
+    }
+    if e.is_connect() {
+        return RemoteError::Offline { what: url.into() };
+    }
+    let mut src: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(e);
+    while let Some(c) = src {
+        if let Some(h) = c.downcast_ref::<hyper::Error>() {
+            if h.is_parse() || h.is_parse_status() {
+                return RemoteError::Protocol {
+                    url: url.into(),
+                    detail: chain(e),
+                };
+            }
+            if h.is_incomplete_message() || h.is_closed() || h.is_canceled() {
+                return RemoteError::Offline { what: url.into() };
+            }
+            if h.is_timeout() {
+                return RemoteError::Timeout { url: url.into() };
+            }
+        }
+        if let Some(io) = c.downcast_ref::<std::io::Error>() {
+            use std::io::ErrorKind::*;
+            match io.kind() {
+                ConnectionReset | ConnectionAborted | BrokenPipe | UnexpectedEof | NotConnected => {
+                    return RemoteError::Offline { what: url.into() }
+                }
+                TimedOut => return RemoteError::Timeout { url: url.into() },
+                InvalidData => {
+                    return RemoteError::Protocol {
+                        url: url.into(),
+                        detail: chain(e),
+                    }
+                }
+                _ => {}
+            }
+        }
+        src = c.source();
+    }
+    RemoteError::Fetch {
+        url: url.into(),
+        status: None,
+        detail: chain(e),
+    }
+}
+
+/// An error with its causes, for the detail text.
+fn chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut c = e.source();
+    while let Some(x) = c {
+        s.push_str(": ");
+        s.push_str(&x.to_string());
+        c = x.source();
+    }
+    s
 }
 
 impl ChunkSource for HttpSource {
@@ -207,6 +257,39 @@ mod tests {
         fn fetch_path(&self, _: &str) -> Result<Vec<u8>, RemoteError> {
             self.0.clone()
         }
+    }
+
+    #[test]
+    fn failures_are_typed() {
+        use crate::testing::{Fault, TestServer};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("f"), vec![7u8; 4000]).unwrap();
+        let srv = TestServer::start(dir.path());
+        let src = HttpSource::new(&srv.addr)
+            .unwrap()
+            .with_timeout(Duration::from_millis(500), 0)
+            .unwrap();
+        let get = |f: Option<Fault>| {
+            srv.clear_faults();
+            if let Some(f) = f {
+                srv.fault("f", f);
+            }
+            src.fetch_path("f")
+        };
+        assert_eq!(get(None).unwrap().len(), 4000);
+        assert!(matches!(get(Some(Fault::Close)), Err(RemoteError::Offline { .. })));
+        assert!(matches!(get(Some(Fault::NotHttp)), Err(RemoteError::Protocol { .. })));
+        assert!(matches!(get(Some(Fault::Truncate)), Err(RemoteError::Truncated { .. })));
+        assert!(matches!(
+            get(Some(Fault::Fail500(5))),
+            Err(RemoteError::Status { status: 500, .. })
+        ));
+        assert!(matches!(
+            get(Some(Fault::Stall(Duration::from_secs(2)))),
+            Err(RemoteError::Timeout { .. })
+        ));
+        srv.clear_faults();
+        assert!(matches!(src.fetch_path("nope"), Err(RemoteError::Status { status: 404, .. })));
     }
 
     #[test]

@@ -22,6 +22,10 @@ pub enum Fault {
     Corrupt,
     /// Sleep this long before answering.
     Stall(Duration),
+    /// Close the connection without answering.
+    Close,
+    /// Answer with bytes that aren't HTTP.
+    NotHttp,
 }
 
 #[derive(Default)]
@@ -187,6 +191,13 @@ fn serve(
         std::thread::sleep(rtt);
         if let Some(Fault::Stall(d)) = fault {
             std::thread::sleep(d);
+        }
+        if let Some(Fault::Close) = fault {
+            return Ok(());
+        }
+        if let Some(Fault::NotHttp) = fault {
+            w.write_all(b"SSH-2.0-OpenSSH_9.6\r\nnot http at all\r\n\r\n")?;
+            return Ok(());
         }
         if let Some(Fault::Fail500(_)) = fault {
             w.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")?;

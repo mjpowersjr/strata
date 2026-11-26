@@ -2042,6 +2042,7 @@ dependencies = [
 name = "strata-fetch"
 version = "0.1.0"
 dependencies = [
+ "hyper",
  "reqwest",
  "strata-object",
  "tempfile",

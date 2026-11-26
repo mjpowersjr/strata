@@ -154,9 +154,7 @@ impl ChunkCache {
         if self.on_disk(sha256) {
             return Ok(0);
         }
-        let before = self.stats().bytes_fetched;
-        self.load(sha256, size, source)?;
-        Ok(self.stats().bytes_fetched.saturating_sub(before))
+        Ok(self.load(sha256, size, source)?.1)
     }
 
     /// Index an entry written to the folder by another cache (another
@@ -244,7 +242,7 @@ impl ChunkCache {
             st.inflight.insert(sha256.to_string(), s.clone());
             s
         };
-        let result = self.load(sha256, size, source);
+        let result = self.load(sha256, size, source).map(|r| r.0);
         let mut st = self.st.lock().unwrap();
         st.inflight.remove(sha256);
         if let Ok(d) = &result {
@@ -268,12 +266,14 @@ impl ChunkCache {
         g.clone().unwrap()
     }
 
+    /// The object's decoded bytes, and the stored bytes fetched for it (0
+    /// when read from disk).
     fn load(
         &self,
         sha256: &str,
         size: u64,
         source: &dyn ChunkSource,
-    ) -> Result<Arc<[u8]>, RemoteError> {
+    ) -> Result<(Arc<[u8]>, u64), RemoteError> {
         let on_disk = self.st.lock().unwrap().disk.contains_key(sha256) || self.adopt(sha256);
         if on_disk {
             if let Ok(stored) = std::fs::read(self.path(sha256)) {
@@ -288,7 +288,7 @@ impl ChunkCache {
                     if let Some(e) = st.disk.get_mut(sha256) {
                         e.1 = t;
                     }
-                    return Ok(d.into());
+                    return Ok((d.into(), 0));
                 }
             }
             let mut st = self.st.lock().unwrap();
@@ -317,7 +317,7 @@ impl ChunkCache {
         };
         // On disk in stored form (compact); in memory decoded.
         self.store(sha256, &stored)?;
-        Ok(d.into())
+        Ok((d.into(), stored.len() as u64))
     }
 
     /// Write verified bytes: temporary name, fsync, rename.
@@ -417,5 +417,9 @@ mod tests {
         let stored = b.stored(&name, raw.len() as u64).unwrap();
         assert_eq!(strata_object::decode(&stored, 1 << 20).unwrap(), raw);
         assert!(b.stored(&strata_object::name(b"absent"), 0).is_none());
+        // Bytes fetched are the object's own stored size, once.
+        let c = ChunkCache::open(&dir.path().join("c"), 1 << 20, 1 << 20).unwrap();
+        assert_eq!(c.fetch_to_disk(&name, raw.len() as u64, &src).unwrap(), src.1.len() as u64);
+        assert_eq!(c.fetch_to_disk(&name, raw.len() as u64, &src).unwrap(), 0);
     }
 }
