@@ -906,6 +906,33 @@ impl Reader {
         Ok(out)
     }
 
+    /// Every node of a tree (internal and leaves) by reading only the
+    /// internal ones: leaves are named by their parents and not fetched.
+    /// For listing (and sizing) what a whole map would download.
+    pub fn node_hashes(&self, root: &Root) -> Result<Vec<Hash>> {
+        let mut out = vec![];
+        let mut level = vec![root.hash];
+        loop {
+            let nodes = self.fetch(&level)?;
+            out.extend(level.iter().copied());
+            if nodes.iter().all(|n| n.level == 0) {
+                return Ok(out);
+            }
+            let mut next: Vec<Hash> = nodes
+                .iter()
+                .filter(|n| n.level > 0)
+                .flat_map(|n| (0..n.keys.len()).map(|i| n.child(i).0).collect::<Vec<_>>())
+                .collect();
+            next.sort();
+            next.dedup();
+            if nodes.iter().all(|n| n.level == 1) {
+                out.extend(next);
+                return Ok(out);
+            }
+            level = next;
+        }
+    }
+
     /// The first key of every leaf, in order (reads the internal nodes).
     pub fn leaf_first_keys(&self, root: &Root) -> Result<Vec<Vec<u8>>> {
         if root.depth == 1 {
@@ -1156,6 +1183,24 @@ mod tests {
         let r2 = Reader::new(dir.path());
         r2.get_many(&root, &keys).unwrap();
         assert_eq!(r2.counts().rounds, root.depth as u64);
+    }
+
+    #[test]
+    fn node_hashes_lists_every_node_without_reading_leaves() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::new(dir.path()).unwrap();
+        for n in [10u32, 50_000] {
+            let root = build(entries(n, None), 2048, &mut w).unwrap();
+            let mut all = Reader::new(dir.path()).all_nodes(&root).unwrap();
+            let r = Reader::new(dir.path());
+            let mut listed = r.node_hashes(&root).unwrap();
+            all.sort();
+            listed.sort();
+            assert_eq!(listed, all);
+            let leaves = root.levels.first().copied().unwrap_or(1);
+            let read = r.counts().fetches;
+            assert_eq!(read, all.len() as u64 - if root.depth > 1 { leaves } else { 0 });
+        }
     }
 
     #[test]

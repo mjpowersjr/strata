@@ -9,7 +9,7 @@
 use crate::prolly::{parse_hash, Fetcher, Reader as Nodes, Root};
 use strata_core::search::{FileRef, SegmentObj};
 use crate::version::{Manifest, Version};
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use strata_fetch::{ChunkCache, ChunkSource, RemoteError};
 pub use strata_core::keys::ValueRef;
 use std::collections::BTreeMap;
@@ -68,7 +68,7 @@ impl ObjDir {
     fn get(&self, f: &FileRef, i: usize) -> io::Result<Arc<[u8]>> {
         self.cache
             .get(&f.chunks[i], self.chunk_len(f, i), &*self.source)
-            .map_err(|e| io::Error::other(e.to_string()))
+            .map_err(io::Error::other)
     }
 
     fn read(&self, name: &str, range: Range<u64>) -> io::Result<Vec<u8>> {
@@ -250,7 +250,9 @@ impl V2Index {
         Self::from_manifest(source, cache, manifest)
     }
 
-    fn save_manifest(&self, state_dir: &Path) -> Result<()> {
+    /// Record this version as the one last opened (what
+    /// [`open_cached`](Self::open_cached) opens).
+    pub fn save_manifest(&self, state_dir: &Path) -> Result<()> {
         let p = saved_path(state_dir, &self.manifest.index);
         std::fs::create_dir_all(p.parent().unwrap())?;
         let tmp = p.with_extension("tmp");
@@ -278,45 +280,30 @@ impl V2Index {
     }
 
     /// Every object this version references, with its size when known (0
-    /// for tree nodes), walking the store maps (which fetches their nodes).
+    /// for tree nodes). Reads the internal tree nodes, not the leaves.
     pub fn objects(&self) -> Result<Vec<(String, u64)>> {
-        let mut out: Vec<(String, u64)> = vec![(
-            self.manifest.version.sha256.clone(),
-            self.manifest.version.size,
-        )];
-        let cs = self.version.search.chunk_size;
-        let files = self
-            .version
-            .search
-            .files
-            .values()
-            .chain(self.segments.iter().flat_map(|s| s.files.values()));
-        for f in files {
-            for (i, c) in f.chunks.iter().enumerate() {
-                out.push((c.clone(), (f.size - i as u64 * cs).min(cs)));
-            }
+        list_objects(&self.manifest, &self.version, &self.segments, &self.q.nodes)
+    }
+
+    /// The objects of the version a manifest names, without opening it:
+    /// reads its version object, segment objects and internal tree nodes
+    /// (through the cache, so offline when they're cached).
+    pub fn objects_of(
+        source: Arc<dyn ChunkSource>,
+        cache: Arc<ChunkCache>,
+        manifest: &Manifest,
+    ) -> Result<(Version, Vec<(String, u64)>)> {
+        let get = |sha: &str, size: u64| cache.get(sha, size, &*source);
+        let vb = get(&manifest.version.sha256, manifest.version.size)?;
+        let version: Version = serde_json::from_slice(&vb).context("version object")?;
+        let mut segments = vec![];
+        for seg in &version.search.segments {
+            let b = get(&seg.object.sha256, seg.object.size)?;
+            segments.push(serde_json::from_slice(&b).context("segment object")?);
         }
-        for s in &self.version.search.segments {
-            out.push((s.object.sha256.clone(), s.object.size));
-            out.push((s.hot.sha256.clone(), s.hot.size));
-            if let Some(d) = &s.del {
-                out.push((d.object.sha256.clone(), d.object.size));
-            }
-        }
-        for m in self.version.store.maps.values() {
-            let root = Root {
-                hash: parse_hash(&m.root)?,
-                depth: m.depth,
-                count: m.count,
-                levels: vec![],
-            };
-            for h in self.q.nodes.all_nodes(&root)? {
-                out.push((crate::prolly::hash_hex(&h), 0));
-            }
-        }
-        out.sort();
-        out.dedup_by(|a, b| a.0 == b.0);
-        Ok(out)
+        let nodes = Nodes::with_fetcher(node_fetcher(&cache, &source));
+        let objs = list_objects(manifest, &version, &segments, &nodes)?;
+        Ok((version, objs))
     }
 
     /// Fetch every object of this version (only those not cached, in
@@ -326,23 +313,25 @@ impl V2Index {
         let objs = self.objects()?;
         let missing: Vec<&(String, u64)> = objs
             .iter()
-            .filter(|(s, _)| !self.cache.contains(s))
+            .filter(|(s, _)| !self.cache.on_disk(s))
             .collect();
+        for (sha, _) in &objs {
+            self.cache.pin(sha);
+        }
         let before = self.cache.stats().bytes_fetched;
         for group in missing.chunks(32) {
             std::thread::scope(|sc| -> Result<()> {
                 let hs: Vec<_> = group
                     .iter()
-                    .map(|(sha, size)| sc.spawn(move || self.cache.get(sha, *size, &*self.source)))
+                    .map(|(sha, size)| {
+                        sc.spawn(move || self.cache.fetch_to_disk(sha, *size, &*self.source))
+                    })
                     .collect();
                 for h in hs {
                     h.join().map_err(|_| anyhow::anyhow!("pin thread"))??;
                 }
                 Ok(())
             })?;
-        }
-        for (sha, _) in &objs {
-            self.cache.pin(sha);
         }
         Ok(PinReport {
             objects: objs.len(),
@@ -376,17 +365,27 @@ impl V2Index {
         Ok(r)
     }
 
+    /// Open the version a manifest names, without recording it as the one
+    /// last opened ([`save_manifest`](Self::save_manifest) does).
+    pub fn open_manifest(
+        source: Arc<dyn ChunkSource>,
+        cache: Arc<ChunkCache>,
+        manifest: Manifest,
+    ) -> Result<Self> {
+        Self::from_manifest(source, cache, manifest)
+    }
+
     fn from_manifest(
         source: Arc<dyn ChunkSource>,
         cache: Arc<ChunkCache>,
         manifest: Manifest,
     ) -> Result<Self> {
         if !crate::version::readable(&manifest) {
-            bail!(
+            return Err(RemoteError::SpecUnsupported(format!(
                 "unsupported index format {} {}",
-                manifest.format,
-                manifest.spec_version
-            );
+                manifest.format, manifest.spec_version
+            ))
+            .into());
         }
         let vb = cache.get(&manifest.version.sha256, manifest.version.size, &*source)?;
         let version: Version = serde_json::from_slice(&vb).context("version object")?;
@@ -473,15 +472,11 @@ impl V2Index {
             source: source.clone(),
         };
         let tindex = Index::open(dir)?;
-        let fetcher: Fetcher = {
-            let (cache, source) = (cache.clone(), source.clone());
-            Arc::new(move |h| {
-                Ok(cache
-                    .get(&crate::prolly::hash_hex(h), 0, &*source)?
-                    .to_vec())
-            })
-        };
-        let q = Opened::new(version.clone(), tindex, Nodes::with_fetcher(fetcher))?;
+        let q = Opened::new(
+            version.clone(),
+            tindex,
+            Nodes::with_fetcher(node_fetcher(&cache, &source)),
+        )?;
         Ok(Self {
             manifest,
             version,
@@ -519,10 +514,88 @@ impl V2Index {
         self.q.range(map, prefix, partial_text, limit)
     }
 
+    /// [`range`](Self::range) from a cursor (`Opened::range_from`): rows,
+    /// and the cursor of the next page (`None` at the end).
+    #[allow(clippy::type_complexity)]
+    pub fn range_from(
+        &self,
+        map: &str,
+        prefix: &[ValueRef<'_>],
+        partial_text: bool,
+        from: Option<&[u8]>,
+        limit: Option<u64>,
+    ) -> Result<(
+        Vec<serde_json::Map<String, serde_json::Value>>,
+        Option<Vec<u8>>,
+    )> {
+        self.q.range_from(map, prefix, partial_text, from, limit)
+    }
+
+    /// The cache and source this index reads through.
+    pub fn cache(&self) -> &Arc<ChunkCache> {
+        &self.cache
+    }
+    pub fn source(&self) -> &Arc<dyn ChunkSource> {
+        &self.source
+    }
+
     /// Round trips, nodes and bytes the store reader has fetched so far.
     pub fn store_counts(&self) -> crate::prolly::Counts {
         self.q.nodes.counts()
     }
+}
+
+fn node_fetcher(cache: &Arc<ChunkCache>, source: &Arc<dyn ChunkSource>) -> Fetcher {
+    let (cache, source) = (cache.clone(), source.clone());
+    Arc::new(move |h| {
+        Ok(cache
+            .get(&crate::prolly::hash_hex(h), 0, &*source)?
+            .to_vec())
+    })
+}
+
+fn list_objects(
+    manifest: &Manifest,
+    version: &Version,
+    segments: &[SegmentObj],
+    nodes: &Nodes,
+) -> Result<Vec<(String, u64)>> {
+    let mut out: Vec<(String, u64)> = vec![(
+        manifest.version.sha256.clone(),
+        manifest.version.size,
+    )];
+    let cs = version.search.chunk_size;
+    let files = version
+        .search
+        .files
+        .values()
+        .chain(segments.iter().flat_map(|s| s.files.values()));
+    for f in files {
+        for (i, c) in f.chunks.iter().enumerate() {
+            out.push((c.clone(), (f.size - i as u64 * cs).min(cs)));
+        }
+    }
+    for s in &version.search.segments {
+        out.push((s.object.sha256.clone(), s.object.size));
+        out.push((s.hot.sha256.clone(), s.hot.size));
+        if let Some(d) = &s.del {
+            out.push((d.object.sha256.clone(), d.object.size));
+        }
+    }
+    for m in version.store.maps.values() {
+        let root = Root {
+            hash: parse_hash(&m.root)?,
+            depth: m.depth,
+            count: m.count,
+            levels: vec![],
+        };
+        for h in nodes.node_hashes(&root)? {
+            out.push((crate::prolly::hash_hex(&h), 0));
+        }
+    }
+    out.sort();
+    out.dedup_by(|a, b| a.0 == b.0);
+    Ok(out)
 }
 
 /// What a pin did.
