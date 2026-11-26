@@ -123,9 +123,71 @@ impl ChunkCache {
         st.mem_bytes = 0;
     }
 
+    /// Whether the object is here, in memory or on disk. A file another
+    /// cache on the same folder wrote since this one opened counts (and is
+    /// adopted).
     pub fn contains(&self, sha256: &str) -> bool {
-        let st = self.st.lock().unwrap();
-        st.mem.contains_key(sha256) || st.disk.contains_key(sha256)
+        {
+            let st = self.st.lock().unwrap();
+            if st.mem.contains_key(sha256) || st.disk.contains_key(sha256) {
+                return true;
+            }
+        }
+        self.adopt(sha256)
+    }
+
+    /// Whether the object is on disk here (memory alone doesn't count:
+    /// what's kept offline must survive a restart).
+    pub fn on_disk(&self, sha256: &str) -> bool {
+        self.st.lock().unwrap().disk.contains_key(sha256) || self.adopt(sha256)
+    }
+
+    /// Make sure the object is on disk, fetching it if it isn't (even when
+    /// a copy is in memory). Returns the stored bytes fetched (0 if it was
+    /// already there).
+    pub fn fetch_to_disk(
+        &self,
+        sha256: &str,
+        size: u64,
+        source: &dyn ChunkSource,
+    ) -> Result<u64, RemoteError> {
+        if self.on_disk(sha256) {
+            return Ok(0);
+        }
+        let before = self.stats().bytes_fetched;
+        self.load(sha256, size, source)?;
+        Ok(self.stats().bytes_fetched.saturating_sub(before))
+    }
+
+    /// Index an entry written to the folder by another cache (another
+    /// process, or a second cache opened on it). It's verified when read.
+    fn adopt(&self, sha256: &str) -> bool {
+        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        let Ok(m) = std::fs::metadata(self.path(sha256)) else {
+            return false;
+        };
+        let mut st = self.st.lock().unwrap();
+        st.tick += 1;
+        let t = st.tick;
+        if st.disk.insert(sha256.to_string(), (m.len(), t)).is_none() {
+            st.disk_bytes += m.len();
+        }
+        st.stats.bytes_on_disk = st.disk_bytes;
+        true
+    }
+
+    /// An object's stored form (as published: encoding byte and payload),
+    /// verified, if it's on disk here; for serving the cache to other
+    /// devices. Nothing is fetched.
+    pub fn stored(&self, sha256: &str, size: u64) -> Option<Vec<u8>> {
+        if !self.contains(sha256) {
+            return None;
+        }
+        let b = std::fs::read(self.path(sha256)).ok()?;
+        strata_object::decode_verified(&b, sha256, size).ok()?;
+        Some(b)
     }
 
     fn path(&self, sha256: &str) -> PathBuf {
@@ -212,7 +274,7 @@ impl ChunkCache {
         size: u64,
         source: &dyn ChunkSource,
     ) -> Result<Arc<[u8]>, RemoteError> {
-        let on_disk = self.st.lock().unwrap().disk.contains_key(sha256);
+        let on_disk = self.st.lock().unwrap().disk.contains_key(sha256) || self.adopt(sha256);
         if on_disk {
             if let Ok(stored) = std::fs::read(self.path(sha256)) {
                 // Entries were verified before they were written; decode and
@@ -320,5 +382,40 @@ impl ChunkCache {
             }
         }
         st.stats.bytes_on_disk = st.disk_bytes;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Count(std::sync::atomic::AtomicUsize, Vec<u8>);
+    impl ChunkSource for Count {
+        fn fetch(&self, _: &str, _: u64) -> Result<Vec<u8>, RemoteError> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.1.clone())
+        }
+        fn fetch_path(&self, p: &str) -> Result<Vec<u8>, RemoteError> {
+            Err(RemoteError::Io(p.into()))
+        }
+    }
+
+    #[test]
+    fn a_second_cache_on_one_folder_sees_new_objects() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = ChunkCache::open(dir.path(), 1 << 20, 1 << 20).unwrap();
+        let b = ChunkCache::open(dir.path(), 1 << 20, 1 << 20).unwrap();
+        let raw = b"some object".to_vec();
+        let name = strata_object::name(&raw);
+        let src = Count(Default::default(), strata_object::encode(&raw, strata_object::Codec::Zstd(3)));
+        assert!(!b.contains(&name));
+        assert_eq!(&*a.get(&name, raw.len() as u64, &src).unwrap(), &raw[..]);
+        // b opened before a fetched it: it finds the file instead of fetching.
+        assert!(b.contains(&name));
+        assert_eq!(&*b.get(&name, raw.len() as u64, &src).unwrap(), &raw[..]);
+        assert_eq!(src.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let stored = b.stored(&name, raw.len() as u64).unwrap();
+        assert_eq!(strata_object::decode(&stored, 1 << 20).unwrap(), raw);
+        assert!(b.stored(&strata_object::name(b"absent"), 0).is_none());
     }
 }
