@@ -155,6 +155,7 @@ pub fn build_store(
         entries.sort();
         entries.dedup_by(|a, b| a.0 == b.0);
         let n = entries.len() as u64;
+        w.begin_tree();
         let root = build(entries, node_target, w).with_context(|| table.to_string())?;
         maps.insert(
             table.to_string(),
@@ -162,6 +163,7 @@ pub fn build_store(
                 root: hash_hex(&root.hash),
                 depth: root.depth,
                 count: n,
+                bytes: w.tree_bytes(),
                 levels: root.levels.clone(),
                 key: pk.clone(),
                 columns: all.clone(),
@@ -206,6 +208,7 @@ pub fn build_store(
             entries.sort();
             entries.dedup_by(|a, b| a.0 == b.0);
             let n = entries.len() as u64;
+            w.begin_tree();
             let root = build(entries, node_target, w).with_context(|| name.clone())?;
             let mut key: Vec<String> = cols.clone();
             key.extend(pk.iter().cloned());
@@ -215,6 +218,7 @@ pub fn build_store(
                     root: hash_hex(&root.hash),
                     depth: root.depth,
                     count: n,
+                    bytes: w.tree_bytes(),
                     levels: root.levels.clone(),
                     key,
                     columns: vec![],

@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 /// 3.1: the version's `audio_base` is `files_base` (3.0 versions still read).
 /// 3.0: objects are named by the sha256 of their decoded bytes and stored
 /// with an encoding byte (`strata_object`); the tree moved to `v3/`.
-pub const SPEC_VERSION: &str = "3.1.0";
+/// 3.2: a map may record its nodes' stored bytes (`MapRef::bytes`).
+pub const SPEC_VERSION: &str = "3.2.0";
 /// `Manifest::format`.
 pub const FORMAT: &str = "v3";
 /// The published tree's prefix under the public base: `{TREE}/objects/{sha}`,
@@ -54,6 +55,10 @@ pub struct MapRef {
     pub root: String,
     pub depth: u8,
     pub count: u64,
+    /// Stored bytes of all the map's nodes (3.2; 0 when not recorded): what
+    /// downloading the whole map costs.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub bytes: u64,
     /// Nodes per level, leaves first (for in-place edits; `prolly::Root::levels`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub levels: Vec<u64>,
@@ -72,6 +77,10 @@ pub struct MapRef {
 pub struct StoreRef {
     pub node_target: usize,
     pub maps: BTreeMap<String, MapRef>,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 #[cfg(test)]

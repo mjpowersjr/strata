@@ -317,5 +317,13 @@ fn bytes_fetched_match_what_was_written() {
         .unwrap();
     let written = dir_bytes(&root.join("cache")) - before;
     assert_eq!(r.bytes_fetched, written);
+    // With map bytes recorded, a whole-index plan is close to the truth (an
+    // upper bound only for the few compressed search objects).
+    let fresh = w.lib("fresh");
+    let fx = fresh.index("things").unwrap();
+    let plan = fresh.plan_keep(&fx).unwrap();
+    let got = fresh.keep_offline(&fx).unwrap().bytes_fetched;
+    assert!(!plan.estimated);
+    assert!(plan.missing_bytes >= got && plan.missing_bytes < got + got / 10, "{plan:?} vs {got}");
     assert_eq!(*last.lock().unwrap(), written);
 }

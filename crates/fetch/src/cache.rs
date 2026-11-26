@@ -142,6 +142,14 @@ impl ChunkCache {
         self.st.lock().unwrap().disk.contains_key(sha256) || self.adopt(sha256)
     }
 
+    /// The object's stored size on disk here, if it is.
+    pub fn disk_size(&self, sha256: &str) -> Option<u64> {
+        if !self.on_disk(sha256) {
+            return None;
+        }
+        self.st.lock().unwrap().disk.get(sha256).map(|e| e.0)
+    }
+
     /// Make sure the object is on disk, fetching it if it isn't (even when
     /// a copy is in memory). Returns the stored bytes fetched (0 if it was
     /// already there).

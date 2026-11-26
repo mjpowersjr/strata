@@ -7,9 +7,11 @@ use std::sync::Arc;
 /// What a download would fetch ([`Library::plan_keep`](crate::Library::plan_keep),
 /// [`Library::plan_sync`](crate::Library::plan_sync)).
 ///
-/// Sizes are decoded sizes, an upper bound on the download (some objects
-/// are stored compressed). Tree nodes have no recorded size and are
-/// counted at the version's target node size (`estimated` is then true).
+/// Sizes are stored sizes: exact for search objects (decoded size plus the
+/// encoding byte; a few small compressed ones count as an upper bound) and
+/// for the tree nodes when the version records each map's bytes (spec 3.2:
+/// missing = recorded total less what's on disk). A version without them
+/// counts nodes at its target node size, an upper bound (`estimated`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Plan {
     /// The version planned for.

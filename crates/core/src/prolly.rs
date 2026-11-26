@@ -132,6 +132,12 @@ pub struct Writer {
     sink: Sink,
     pub written: HashSet<Hash>,
     pub bytes: u64,
+    /// Stored size of every node put (also those already published).
+    sizes: HashMap<Hash, u32>,
+    /// Nodes of the tree being built since [`begin_tree`](Self::begin_tree),
+    /// and their stored bytes.
+    tree: HashSet<Hash>,
+    tree_bytes: u64,
 }
 
 impl Writer {
@@ -141,6 +147,9 @@ impl Writer {
             sink: Sink::Dir(dir.to_path_buf()),
             written: HashSet::new(),
             bytes: 0,
+            sizes: HashMap::new(),
+            tree: HashSet::new(),
+            tree_bytes: 0,
         })
     }
     /// Keep nodes in memory ([`Writer::take_nodes`]).
@@ -149,6 +158,9 @@ impl Writer {
             sink: Sink::Mem(BTreeMap::new()),
             written: HashSet::new(),
             bytes: 0,
+            sizes: HashMap::new(),
+            tree: HashSet::new(),
+            tree_bytes: 0,
         }
     }
     /// The nodes a memory writer holds, by hash.
@@ -158,6 +170,19 @@ impl Writer {
             Sink::Dir(_) => BTreeMap::new(),
         }
     }
+    /// Start counting a new tree's nodes ([`tree_bytes`](Self::tree_bytes)).
+    pub fn begin_tree(&mut self) {
+        self.tree.clear();
+        self.tree_bytes = 0;
+    }
+
+    /// Stored bytes of the nodes put since [`begin_tree`](Self::begin_tree),
+    /// each once, published before or not: what downloading the whole tree
+    /// costs (`MapRef::bytes`).
+    pub fn tree_bytes(&self) -> u64 {
+        self.tree_bytes
+    }
+
     fn put(&mut self, n: &Node) -> Result<Hash> {
         let raw = n.encode();
         let h: Hash = Sha256::digest(&raw).into();
@@ -167,6 +192,7 @@ impl Writer {
                 self.written.len() < 2_000_000,
                 "tree writer passed 2M nodes: aborting"
             );
+            self.sizes.insert(h, b.len() as u32);
             match &mut self.sink {
                 Sink::Dir(dir) => {
                     let p = dir.join(hex(&h));
@@ -181,6 +207,9 @@ impl Writer {
                     m.insert(h, b);
                 }
             }
+        }
+        if self.tree.insert(h) {
+            self.tree_bytes += self.sizes.get(&h).copied().unwrap_or(0) as u64;
         }
         Ok(h)
     }
@@ -1200,6 +1229,24 @@ mod tests {
             let leaves = root.levels.first().copied().unwrap_or(1);
             let read = r.counts().fetches;
             assert_eq!(read, all.len() as u64 - if root.depth > 1 { leaves } else { 0 });
+        }
+    }
+
+    #[test]
+    fn tree_bytes_are_the_stored_size_of_its_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut w = Writer::new(dir.path()).unwrap();
+        for n in [5u32, 20_000, 20_000] {
+            // The second 20,000 reuses every node: still counted in full.
+            w.begin_tree();
+            let root = build(entries(n, None), 2048, &mut w).unwrap();
+            let on_disk: u64 = Reader::new(dir.path())
+                .all_nodes(&root)
+                .unwrap()
+                .iter()
+                .map(|h| std::fs::metadata(dir.path().join(hex(h))).unwrap().len())
+                .sum();
+            assert_eq!(w.tree_bytes(), on_disk);
         }
     }
 

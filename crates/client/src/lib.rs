@@ -389,7 +389,7 @@ impl Library {
     /// in the cache (unpinned), so a later keep resumes where it stopped.
     pub fn keep_offline_with(&self, ix: &Index, ctl: &Control) -> Result<SyncReport> {
         let objs = ix.ix.objects()?;
-        let node_size = ix.ix.version.store.node_target as u64;
+        let node_size = node_estimate(&ix.ix.version);
         let (fetched, bytes) = self.fetch_pinned(&objs, node_size, ctl)?;
         let name = ix.name().to_string();
         self.adopt_pins(&name, &ix.ix.manifest.version.sha256, objs);
@@ -468,7 +468,7 @@ impl Library {
     /// downloaded but the internal tree nodes, usually already cached).
     pub fn plan_keep(&self, ix: &Index) -> Result<Plan> {
         let objs = ix.ix.objects()?;
-        Ok(self.plan_of(ix.seq(), &objs, ix.ix.version.store.node_target as u64))
+        Ok(self.plan_of(ix.seq(), &objs, &ix.ix.version))
     }
 
     /// What [`sync`](Self::sync) would move to and, for a kept index,
@@ -480,7 +480,7 @@ impl Library {
             return Ok(None);
         };
         let (v, objs) = V2Index::objects_of(self.source.clone(), self.cache.clone(), &m)?;
-        let mut p = self.plan_of(m.seq, &objs, v.store.node_target as u64);
+        let mut p = self.plan_of(m.seq, &objs, &v);
         if !self.is_kept(ix.name()) {
             // Not kept: opening fetches the segments' hot packs; the rest is
             // read on demand.
@@ -490,28 +490,55 @@ impl Library {
                 .iter()
                 .map(|s| (s.hot.sha256.clone(), s.hot.size))
                 .collect();
-            let h = self.plan_of(m.seq, &hot, 0);
+            let h = self.plan_of(m.seq, &hot, &v);
             p.missing = h.missing;
             p.missing_bytes = h.missing_bytes;
         }
         Ok(Some(p))
     }
 
-    fn plan_of(&self, seq: u64, objs: &[(String, u64)], node_size: u64) -> Plan {
-        let est = |size: u64| stored_bound(size, node_size);
+    fn plan_of(&self, seq: u64, objs: &[(String, u64)], v: &strata::version::Version) -> Plan {
+        let node_size = node_estimate(v);
+        let recorded = node_bytes(v);
         let mut p = Plan {
             seq,
             objects: objs.len(),
             bytes: 0,
             missing: 0,
             missing_bytes: 0,
-            estimated: objs.iter().any(|o| o.1 == 0),
+            estimated: false,
         };
+        let (mut nodes, mut nodes_missing, mut nodes_present_bytes) = (0u64, 0u64, 0u64);
         for (sha, size) in objs {
-            p.bytes += est(*size);
-            if !self.cache.on_disk(sha) {
-                p.missing += 1;
-                p.missing_bytes += est(*size);
+            let have = self.cache.disk_size(sha);
+            if *size == 0 {
+                nodes += 1;
+                match have {
+                    Some(b) => nodes_present_bytes += b,
+                    None => nodes_missing += 1,
+                }
+            } else {
+                p.bytes += size + 1;
+                if have.is_none() {
+                    p.missing += 1;
+                    p.missing_bytes += size + 1;
+                }
+            }
+        }
+        p.missing += nodes_missing as usize;
+        match recorded {
+            // Every map records its bytes: what's missing is the total less
+            // what's here (exact, nodes shared between maps aside).
+            Some(total) => {
+                p.bytes += total;
+                if nodes_missing > 0 {
+                    p.missing_bytes += total.saturating_sub(nodes_present_bytes).max(nodes_missing);
+                }
+            }
+            None => {
+                p.bytes += nodes * node_size;
+                p.missing_bytes += nodes_missing * node_size;
+                p.estimated = nodes > 0;
             }
         }
         p
@@ -562,7 +589,7 @@ impl Library {
         if self.is_kept(ix.name()) {
             let objs = newer.objects()?;
             (fetched, bytes) =
-                self.fetch_pinned(&objs, newer.version.store.node_target as u64, ctl)?;
+                self.fetch_pinned(&objs, node_estimate(&newer.version), ctl)?;
             // The new version is complete and pinned: record it, release the old.
             let name = ix.name().to_string();
             self.adopt_pins(&name, &newer.manifest.version.sha256, objs);
@@ -607,11 +634,27 @@ impl Library {
     }
 }
 
+/// The stored bytes of all tree nodes, when every map records them (3.2).
+fn node_bytes(v: &strata::version::Version) -> Option<u64> {
+    let maps = &v.store.maps;
+    (!maps.is_empty() && maps.values().all(|m| m.bytes > 0)).then(|| maps.values().map(|m| m.bytes).sum())
+}
+
+/// A tree node's expected stored size: the recorded average, or (before
+/// 3.2) the target node size, an upper bound.
+fn node_estimate(v: &strata::version::Version) -> u64 {
+    let nodes: u64 = v.store.maps.values().map(|m| m.levels.iter().sum::<u64>()).sum();
+    match node_bytes(v) {
+        Some(b) if nodes > 0 => b.div_ceil(nodes),
+        _ => v.store.node_target as u64 + 1,
+    }
+}
+
 /// An upper bound on an object's stored size: its decoded size plus the
 /// encoding byte; a tree node (size unrecorded) at the target node size.
 fn stored_bound(size: u64, node_size: u64) -> u64 {
     if size == 0 {
-        node_size + 1
+        node_size
     } else {
         size + 1
     }

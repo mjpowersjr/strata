@@ -1,8 +1,12 @@
-# strata format (spec 3.0)
+# strata format (spec 3.2)
 
 The published format: content-addressed objects under one manifest per index
 version, tantivy search segments, and prolly-tree record maps.
 
+- **3.2 (2026-11-26):** a store map may record `bytes`, its nodes' total stored size, so a
+  reader can size a whole download exactly before fetching (section 3). Optional; 3.0 and 3.1
+  versions still read.
+- **3.1 (2026-11-25):** the version's `audio_base` is `files_base`.
 - **3.0 (2026-11-25):** objects are named by the sha256 of their decoded bytes and stored with
   an encoding byte (section 2, "Stored form"). Published trees use the prefix `v3/`.
 - **2.x:** objects named by the hash of their stored bytes (nodes compressed first).
@@ -103,7 +107,7 @@ A JSON object in `objects/`, describing one complete version:
   "store": {
     "node_target": 16384,
     "maps": {
-      "episodes":        { "root": "…", "depth": 4, "count": 218861, "levels": [1630, 12, 1], "key": ["id"] },
+      "episodes":        { "root": "…", "depth": 4, "count": 218861, "bytes": 9123456, "levels": [1630, 12, 1], "key": ["id"] },
       "series_by_count": { "root": "…", "depth": 2, "count": 12870, "key": ["n_episodes desc", "slug"], "of": "series" }
     }
   },
@@ -132,7 +136,9 @@ A JSON object in `objects/`, describing one complete version:
   three round trips (manifest, version, segments).
 - **`store.maps`** holds one prolly tree per table and per secondary index (section 5). A map's
   identity is its root hash. `levels` counts its nodes per level (leaves first). Publishers
-  editing in place use it to see a change of height; readers ignore it.
+  editing in place use it to see a change of height. `bytes` (3.2, optional) is the stored size
+  of all its nodes, each once: node sizes are recorded nowhere else, so this is how a reader
+  sizes a download before fetching it (what's missing = `bytes` less the nodes it has).
 
 ## 4. Search (tantivy segments)
 
