@@ -14,3 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The tests publish a small index, serve it over HTTP, and read it.
+strata = { path = "../strata", features = ["sqlite"] }
+rusqlite.workspace = true
+tempfile = "3"
