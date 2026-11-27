@@ -280,9 +280,12 @@ impl V2Index {
     }
 
     /// Every object this version references, with its size when known (0
-    /// for tree nodes). Reads the internal tree nodes, not the leaves.
+    /// for tree nodes). Reads the internal tree nodes, not the leaves,
+    /// through a reader of its own: a whole index's internal nodes, decoded,
+    /// aren't kept in this version's node cache for as long as it is open.
     pub fn objects(&self) -> Result<Vec<(String, u64)>> {
-        list_objects(&self.manifest, &self.version, &self.segments, &self.q.nodes)
+        let nodes = Nodes::with_fetcher(node_fetcher(&self.cache, &self.source));
+        list_objects(&self.manifest, &self.version, &self.segments, &nodes)
     }
 
     /// The objects of the version a manifest names, without opening it:
@@ -537,6 +540,11 @@ impl V2Index {
     }
     pub fn source(&self) -> &Arc<dyn ChunkSource> {
         &self.source
+    }
+
+    /// Drop the decoded tree nodes this version holds in memory.
+    pub fn clear_memory(&self) {
+        self.q.nodes.clear_cache();
     }
 
     /// Round trips, nodes and bytes the store reader has fetched so far.

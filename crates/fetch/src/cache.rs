@@ -7,6 +7,7 @@ use crate::{ChunkSource, RemoteError};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
@@ -21,6 +22,41 @@ pub struct CacheStats {
     pub integrity_failures: u64,
 }
 
+/// An object's name as its 32 bytes: the key of the maps that hold an
+/// entry per object on disk or pinned (a whole kept index is tens of
+/// thousands of objects; 64-character strings for each cost several times
+/// more).
+type Id = [u8; 32];
+
+/// The id of a name (64 lowercase hex characters, as objects are named);
+/// `None` for anything else, which no object can be.
+fn id(sha256: &str) -> Option<Id> {
+    let b = sha256.as_bytes();
+    if b.len() != 64 {
+        return None;
+    }
+    let nib = |c: u8| match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        _ => None,
+    };
+    let mut out = [0u8; 32];
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = nib(b[2 * i])? << 4 | nib(b[2 * i + 1])?;
+    }
+    Some(out)
+}
+
+fn hex_of(id: &Id) -> String {
+    const D: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(64);
+    for b in id {
+        s.push(D[(b >> 4) as usize] as char);
+        s.push(D[(b & 15) as usize] as char);
+    }
+    s
+}
+
 type Slot = Arc<(Mutex<Option<Result<Arc<[u8]>, RemoteError>>>, Condvar)>;
 
 #[derive(Default)]
@@ -28,9 +64,9 @@ struct State {
     tick: u64,
     mem: HashMap<String, (Arc<[u8]>, u64)>,
     mem_bytes: u64,
-    disk: HashMap<String, (u64, u64)>,
+    disk: HashMap<Id, (u64, u64)>,
     disk_bytes: u64,
-    pins: HashMap<String, u32>,
+    pins: HashMap<Id, u32>,
     inflight: HashMap<String, Slot>,
     stats: CacheStats,
 }
@@ -43,7 +79,8 @@ pub struct ChunkCache {
     /// (measured: 1.2 s to open a 371-chunk hot cache on loopback).
     fsync: bool,
     disk_cap: Mutex<u64>,
-    mem_cap: u64,
+    /// Decoded objects kept in memory, at most (bytes; 0 keeps none).
+    mem_cap: AtomicU64,
     st: Mutex<State>,
 }
 
@@ -74,8 +111,9 @@ impl ChunkCache {
         found.sort();
         let mut st = State::default();
         for (_, name, len) in found {
+            let Some(k) = id(&name) else { continue };
             st.tick += 1;
-            st.disk.insert(name, (len, st.tick));
+            st.disk.insert(k, (len, st.tick));
             st.disk_bytes += len;
         }
         st.stats.bytes_on_disk = st.disk_bytes;
@@ -83,7 +121,7 @@ impl ChunkCache {
             dir: dir.to_path_buf(),
             fsync: false,
             disk_cap: Mutex::new(disk_cap),
-            mem_cap,
+            mem_cap: AtomicU64::new(mem_cap),
             st: Mutex::new(st),
         }))
     }
@@ -119,8 +157,22 @@ impl ChunkCache {
     /// Drop the in-memory copies (the disk stays).
     pub fn clear_memory(&self) {
         let mut st = self.st.lock().unwrap();
-        st.mem.clear();
+        st.mem = HashMap::new();
         st.mem_bytes = 0;
+    }
+
+    /// Change the in-memory cap (bytes of decoded objects; 0 keeps none),
+    /// evicting the least recently used down to it.
+    pub fn set_memory_cap(&self, bytes: u64) {
+        self.mem_cap.store(bytes, Ordering::Relaxed);
+        let mut st = self.st.lock().unwrap();
+        self.evict_mem(&mut st);
+    }
+
+    /// The in-memory cap, and the decoded bytes held in memory now.
+    pub fn memory(&self) -> (u64, u64) {
+        let cap = self.mem_cap.load(Ordering::Relaxed);
+        (cap, self.st.lock().unwrap().mem_bytes)
     }
 
     /// Whether the object is here, in memory or on disk. A file another
@@ -129,7 +181,7 @@ impl ChunkCache {
     pub fn contains(&self, sha256: &str) -> bool {
         {
             let st = self.st.lock().unwrap();
-            if st.mem.contains_key(sha256) || st.disk.contains_key(sha256) {
+            if st.mem.contains_key(sha256) || id(sha256).is_some_and(|k| st.disk.contains_key(&k)) {
                 return true;
             }
         }
@@ -139,7 +191,12 @@ impl ChunkCache {
     /// Whether the object is on disk here (memory alone doesn't count:
     /// what's kept offline must survive a restart).
     pub fn on_disk(&self, sha256: &str) -> bool {
-        self.st.lock().unwrap().disk.contains_key(sha256) || self.adopt(sha256)
+        self.indexed(sha256) || self.adopt(sha256)
+    }
+
+    /// Whether the object is in this cache's index of the disk.
+    fn indexed(&self, sha256: &str) -> bool {
+        id(sha256).is_some_and(|k| self.st.lock().unwrap().disk.contains_key(&k))
     }
 
     /// The object's stored size on disk here, if it is.
@@ -147,7 +204,8 @@ impl ChunkCache {
         if !self.on_disk(sha256) {
             return None;
         }
-        self.st.lock().unwrap().disk.get(sha256).map(|e| e.0)
+        let k = id(sha256)?;
+        self.st.lock().unwrap().disk.get(&k).map(|e| e.0)
     }
 
     /// Make sure the object is on disk, fetching it if it isn't (even when
@@ -162,22 +220,50 @@ impl ChunkCache {
         if self.on_disk(sha256) {
             return Ok(0);
         }
-        Ok(self.load(sha256, size, source)?.1)
+        self.fetch_verified(sha256, size, source)
+    }
+
+    /// Fetch an object, verify it and write it to disk, without keeping
+    /// (or allocating for each object) its decoded bytes; the stored bytes
+    /// fetched.
+    fn fetch_verified(
+        &self,
+        sha256: &str,
+        size: u64,
+        source: &dyn ChunkSource,
+    ) -> Result<u64, RemoteError> {
+        let t0 = Instant::now();
+        let stored = source.fetch(sha256, size)?;
+        let ms = t0.elapsed().as_millis() as u64;
+        {
+            let mut st = self.st.lock().unwrap();
+            st.stats.misses += 1;
+            st.stats.bytes_fetched += stored.len() as u64;
+            st.stats.fetch_ms += ms;
+        }
+        if strata_object::verify(&stored, sha256, size).is_err() {
+            self.st.lock().unwrap().stats.integrity_failures += 1;
+            return Err(RemoteError::Integrity {
+                chunk: sha256.into(),
+            });
+        }
+        self.store(sha256, &stored)?;
+        Ok(stored.len() as u64)
     }
 
     /// Index an entry written to the folder by another cache (another
     /// process, or a second cache opened on it). It's verified when read.
     fn adopt(&self, sha256: &str) -> bool {
-        if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        let Some(k) = id(sha256) else {
             return false;
-        }
+        };
         let Ok(m) = std::fs::metadata(self.path(sha256)) else {
             return false;
         };
         let mut st = self.st.lock().unwrap();
         st.tick += 1;
         let t = st.tick;
-        if st.disk.insert(sha256.to_string(), (m.len(), t)).is_none() {
+        if st.disk.insert(k, (m.len(), t)).is_none() {
             st.disk_bytes += m.len();
         }
         st.stats.bytes_on_disk = st.disk_bytes;
@@ -201,21 +287,19 @@ impl ChunkCache {
     }
 
     pub fn pin(&self, sha256: &str) {
-        *self
-            .st
-            .lock()
-            .unwrap()
-            .pins
-            .entry(sha256.to_string())
-            .or_default() += 1;
+        // Anything that isn't an object's name can never be stored here.
+        let Some(k) = id(sha256) else { return };
+        *self.st.lock().unwrap().pins.entry(k).or_default() += 1;
     }
 
     pub fn unpin(&self, sha256: &str) {
         let mut st = self.st.lock().unwrap();
-        if let Some(n) = st.pins.get_mut(sha256) {
-            *n -= 1;
-            if *n == 0 {
-                st.pins.remove(sha256);
+        if let Some(k) = id(sha256) {
+            if let Some(n) = st.pins.get_mut(&k) {
+                *n -= 1;
+                if *n == 0 {
+                    st.pins.remove(&k);
+                }
             }
         }
         self.evict(&mut st);
@@ -250,7 +334,9 @@ impl ChunkCache {
             st.inflight.insert(sha256.to_string(), s.clone());
             s
         };
-        let result = self.load(sha256, size, source).map(|r| r.0);
+        let result = self
+            .load(sha256, size, source)
+            .map(|r| Arc::<[u8]>::from(r.0));
         let mut st = self.st.lock().unwrap();
         st.inflight.remove(sha256);
         if let Ok(d) = &result {
@@ -281,8 +367,8 @@ impl ChunkCache {
         sha256: &str,
         size: u64,
         source: &dyn ChunkSource,
-    ) -> Result<(Arc<[u8]>, u64), RemoteError> {
-        let on_disk = self.st.lock().unwrap().disk.contains_key(sha256) || self.adopt(sha256);
+    ) -> Result<(Vec<u8>, u64), RemoteError> {
+        let on_disk = self.indexed(sha256) || self.adopt(sha256);
         if on_disk {
             if let Ok(stored) = std::fs::read(self.path(sha256)) {
                 // Entries were verified before they were written; decode and
@@ -293,14 +379,14 @@ impl ChunkCache {
                     st.stats.disk_hits += 1;
                     st.tick += 1;
                     let t = st.tick;
-                    if let Some(e) = st.disk.get_mut(sha256) {
+                    if let Some(e) = id(sha256).and_then(|k| st.disk.get_mut(&k)) {
                         e.1 = t;
                     }
-                    return Ok((d.into(), 0));
+                    return Ok((d, 0));
                 }
             }
             let mut st = self.st.lock().unwrap();
-            if let Some((len, _)) = st.disk.remove(sha256) {
+            if let Some((len, _)) = id(sha256).and_then(|k| st.disk.remove(&k)) {
                 st.disk_bytes -= len;
             }
             let _ = std::fs::remove_file(self.path(sha256));
@@ -325,7 +411,7 @@ impl ChunkCache {
         };
         // On disk in stored form (compact); in memory decoded.
         self.store(sha256, &stored)?;
-        Ok((d.into(), stored.len() as u64))
+        Ok((d, stored.len() as u64))
     }
 
     /// Write verified bytes: temporary name, fsync, rename.
@@ -342,14 +428,12 @@ impl ChunkCache {
             }
         }
         std::fs::rename(&tmp, &p).map_err(io)?;
+        // Only verified objects are stored, so the name is an object's.
+        let Some(k) = id(sha256) else { return Ok(()) };
         let mut st = self.st.lock().unwrap();
         st.tick += 1;
         let t = st.tick;
-        if st
-            .disk
-            .insert(sha256.to_string(), (d.len() as u64, t))
-            .is_none()
-        {
+        if st.disk.insert(k, (d.len() as u64, t)).is_none() {
             st.disk_bytes += d.len() as u64;
         }
         self.evict(&mut st);
@@ -357,7 +441,13 @@ impl ChunkCache {
     }
 
     fn evict_mem(&self, st: &mut State) {
-        while st.mem_bytes > self.mem_cap && !st.mem.is_empty() {
+        let cap = self.mem_cap.load(Ordering::Relaxed);
+        if cap == 0 {
+            st.mem = HashMap::new();
+            st.mem_bytes = 0;
+            return;
+        }
+        while st.mem_bytes > cap && !st.mem.is_empty() {
             let oldest = st
                 .mem
                 .iter()
@@ -373,18 +463,18 @@ impl ChunkCache {
     fn evict(&self, st: &mut State) {
         let cap = *self.disk_cap.lock().unwrap();
         if st.disk_bytes > cap {
-            let mut order: Vec<(u64, String, u64)> = st
+            let mut order: Vec<(u64, Id, u64)> = st
                 .disk
                 .iter()
                 .filter(|(k, _)| !st.pins.contains_key(*k))
-                .map(|(k, (len, t))| (*t, k.clone(), *len))
+                .map(|(k, (len, t))| (*t, *k, *len))
                 .collect();
             order.sort();
             for (_, k, len) in order {
                 if st.disk_bytes <= cap {
                     break;
                 }
-                let _ = std::fs::remove_file(self.path(&k));
+                let _ = std::fs::remove_file(self.path(&hex_of(&k)));
                 st.disk.remove(&k);
                 st.disk_bytes -= len;
             }
@@ -429,5 +519,72 @@ mod tests {
         let c = ChunkCache::open(&dir.path().join("c"), 1 << 20, 1 << 20).unwrap();
         assert_eq!(c.fetch_to_disk(&name, raw.len() as u64, &src).unwrap(), src.1.len() as u64);
         assert_eq!(c.fetch_to_disk(&name, raw.len() as u64, &src).unwrap(), 0);
+    }
+
+    #[test]
+    fn ids_round_trip_and_only_object_names_have_one() {
+        let n = strata_object::name(b"x");
+        assert_eq!(hex_of(&id(&n).unwrap()), n);
+        assert!(id(&n.to_uppercase()).is_none());
+        assert!(id(&n[1..]).is_none());
+        assert!(id("absent").is_none());
+    }
+
+    #[test]
+    fn the_memory_cap_holds_the_most_recent_and_can_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ChunkCache::open(dir.path(), 1 << 30, 2500).unwrap();
+        let objs: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i; 1000]).collect();
+        let get = |o: &Vec<u8>| {
+            let src = Count(
+                Default::default(),
+                strata_object::encode(o, strata_object::Codec::Raw),
+            );
+            c.get(&strata_object::name(o), o.len() as u64, &src)
+                .unwrap();
+        };
+        for o in &objs {
+            get(o);
+            assert!(c.memory().1 <= 2500);
+        }
+        assert_eq!(c.memory(), (2500, 2000));
+        let before = c.stats();
+        get(&objs[4]);
+        assert_eq!(c.stats().mem_hits, before.mem_hits + 1);
+        get(&objs[0]);
+        assert_eq!(c.stats().disk_hits, before.disk_hits + 1);
+        c.set_memory_cap(1000);
+        assert_eq!(c.memory(), (1000, 1000));
+        c.set_memory_cap(0);
+        assert_eq!(c.memory(), (0, 0));
+        get(&objs[1]);
+        assert_eq!(c.memory(), (0, 0));
+        c.set_memory_cap(5000);
+        get(&objs[2]);
+        c.clear_memory();
+        assert_eq!(c.memory(), (5000, 0));
+    }
+
+    #[test]
+    fn objects_kept_whole_are_verified_without_their_decoded_bytes_in_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = ChunkCache::open(dir.path(), 1 << 30, 1 << 20).unwrap();
+        let raw = vec![5u8; 300_000];
+        let name = strata_object::name(&raw);
+        let good = Count(
+            Default::default(),
+            strata_object::encode(&raw, strata_object::Codec::Zstd(3)),
+        );
+        assert!(c.fetch_to_disk(&name, raw.len() as u64, &good).unwrap() > 0);
+        assert!(c.on_disk(&name));
+        assert_eq!(c.memory().1, 0);
+        // A wrong body is refused and not written.
+        let other = strata_object::name(b"other");
+        assert!(matches!(
+            c.fetch_to_disk(&other, raw.len() as u64, &good),
+            Err(RemoteError::Integrity { .. })
+        ));
+        assert!(!c.on_disk(&other));
+        assert_eq!(c.stats().integrity_failures, 1);
     }
 }

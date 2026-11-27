@@ -121,6 +121,93 @@ pub fn decode_verified(stored: &[u8], name_hex: &str, size: u64) -> Result<Vec<u
     Ok(raw)
 }
 
+/// Check a stored object against its name without keeping its decoded
+/// bytes (for objects only written to disk, such as a whole index kept
+/// offline). Decodes into a buffer and decoder reused by the calling
+/// thread, so verifying many objects doesn't allocate each one's decoded
+/// size anew. Accepts exactly what [`decode_verified`] accepts.
+pub fn verify(stored: &[u8], name_hex: &str, size: u64) -> Result<(), Error> {
+    use std::cell::RefCell;
+    /// A thread's buffer is let go after an object larger than this.
+    const KEEP: usize = 4 << 20;
+    thread_local! {
+        static SCRATCH: RefCell<(Option<zstd::bulk::Decompressor<'static>>, Vec<u8>)> =
+            const { RefCell::new((None, Vec::new())) };
+    }
+    let max = if size == 0 {
+        MAX_UNSIZED
+    } else {
+        size as usize
+    };
+    let check = |raw: &[u8]| {
+        if size != 0 && raw.len() as u64 != size {
+            return Err(Error::Size {
+                got: raw.len() as u64,
+                want: size,
+            });
+        }
+        if hex::encode(Sha256::digest(raw)) != name_hex {
+            return Err(Error::Hash(name_hex.to_string()));
+        }
+        Ok(())
+    };
+    let (&tag, payload) = stored.split_first().ok_or(Error::Empty)?;
+    match tag {
+        RAW => {
+            if payload.len() > max {
+                return Err(Error::Size {
+                    got: payload.len() as u64,
+                    want: max as u64,
+                });
+            }
+            check(payload)
+        }
+        ZSTD => {
+            let n = match zstd::zstd_safe::get_frame_content_size(payload) {
+                Ok(Some(n)) => n,
+                Ok(None) => return Err(Error::Zstd("frame without a content size".into())),
+                Err(_) => return Err(Error::Zstd("not a zstd frame".into())),
+            };
+            if n > max as u64 {
+                return Err(Error::Size {
+                    got: n,
+                    want: max as u64,
+                });
+            }
+            SCRATCH.with(|s| {
+                let mut s = s.borrow_mut();
+                let (dec, buf) = &mut *s;
+                if dec.is_none() {
+                    *dec = Some(
+                        zstd::bulk::Decompressor::new().map_err(|e| Error::Zstd(e.to_string()))?,
+                    );
+                }
+                buf.clear();
+                buf.reserve(n as usize);
+                let r = dec
+                    .as_mut()
+                    .unwrap()
+                    .decompress_to_buffer(payload, buf)
+                    .map_err(|e| Error::Zstd(e.to_string()))
+                    .and_then(|got| {
+                        if got as u64 != n {
+                            return Err(Error::Size {
+                                got: got as u64,
+                                want: n,
+                            });
+                        }
+                        check(buf)
+                    });
+                if buf.capacity() > KEEP {
+                    *buf = Vec::new();
+                }
+                r
+            })
+        }
+        t => Err(Error::Encoding(t)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,5 +239,27 @@ mod tests {
         assert!(matches!(decode(&[], 10), Err(Error::Empty)));
         // A header-less (old format) object never verifies.
         assert!(decode_verified(&raw, &n, 0).is_err());
+    }
+
+    #[test]
+    fn verify_accepts_and_rejects_what_decode_verified_does() {
+        let raw = b"hello hello hello hello hello".repeat(10);
+        let (n, z) = encode_named(&raw, Codec::Zstd(3));
+        let (_, r) = encode_named(&raw, Codec::Raw);
+        for s in [&z, &r] {
+            verify(s, &n, raw.len() as u64).unwrap();
+            verify(s, &n, 0).unwrap();
+            assert!(matches!(verify(s, &name(b"x"), 0), Err(Error::Hash(_))));
+            assert!(matches!(verify(s, &n, 9), Err(Error::Size { .. })));
+        }
+        // Reused buffer: a larger object, then a smaller one, then one too
+        // big to keep the buffer for.
+        let big = vec![3u8; 5 << 20];
+        let (nb, zb) = encode_named(&big, Codec::Zstd(1));
+        verify(&zb, &nb, big.len() as u64).unwrap();
+        verify(&z, &n, raw.len() as u64).unwrap();
+        assert!(matches!(verify(&[9, 1, 2], &n, 0), Err(Error::Encoding(9))));
+        assert!(matches!(verify(&[], &n, 0), Err(Error::Empty)));
+        assert!(verify(&raw, &n, 0).is_err());
     }
 }

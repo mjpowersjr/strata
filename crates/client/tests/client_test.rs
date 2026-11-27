@@ -9,7 +9,8 @@ use std::sync::{Arc, Mutex};
 use strata::publish::{publish, Profile};
 use strata::search::{Field, Kind, SearchSpec};
 use strata_client::{
-    error_kind, ChunkSource, Control, Cursor, ErrorKind, FallbackSource, Key, Library, SearchQuery,
+    error_kind, ChunkSource, Control, Cursor, ErrorKind, FallbackSource, Key, Library, Options,
+    SearchQuery,
 };
 use strata_fetch::testing::TestServer;
 
@@ -326,4 +327,90 @@ fn bytes_fetched_match_what_was_written() {
     assert!(!plan.estimated);
     assert!(plan.missing_bytes >= got && plan.missing_bytes < got + got / 10, "{plan:?} vs {got}");
     assert_eq!(*last.lock().unwrap(), written);
+}
+
+#[test]
+fn the_memory_cap_is_the_callers_and_clear_memory_empties_it() {
+    let w = World::new();
+    let read_all = |lib: &Library| {
+        let ix = lib.index("things").unwrap();
+        let n = ix
+            .range_iter("things", &[], false, 500)
+            .collect::<anyhow::Result<Vec<_>>>()
+            .unwrap()
+            .len();
+        assert_eq!(n as i64, N);
+        let q = SearchQuery {
+            text: Some("thing".into()),
+            limit: 5,
+            ..Default::default()
+        };
+        assert!(ix.search(&q).unwrap().total > 0);
+        ix
+    };
+    // The default: the same cap as before, and reads are held under it.
+    let lib = w.lib("default");
+    assert_eq!(lib.memory().0, Library::DEFAULT_MEMORY_CAP);
+    let ix = read_all(&lib);
+    let (cap, used) = lib.memory();
+    assert!(used > 0 && used <= cap, "{used} of {cap}");
+    // Lowered while open: the least recently used go down to it.
+    lib.set_memory_cap(used / 2);
+    assert!(lib.memory().1 <= used / 2);
+    lib.clear_memory();
+    ix.clear_memory();
+    assert_eq!(lib.memory().1, 0);
+    // Everything still reads (from the disk cache).
+    read_all(&lib);
+
+    // A cap from the caller, through open_with: none held at 0, and every
+    // read still answers (the second time from disk, nothing fetched).
+    let src = Library::http_source(&w.server.addr).unwrap();
+    let none = Library::open_with_options(
+        &w.dir.path().join("none"),
+        1 << 30,
+        src,
+        Options::default().memory_cap(0),
+    )
+    .unwrap();
+    assert_eq!(none.memory(), (0, 0));
+    read_all(&none);
+    assert_eq!(none.memory(), (0, 0));
+    let small = 64 << 10;
+    let src = Library::http_source(&w.server.addr).unwrap();
+    let capped = Library::open_with_options(
+        &w.dir.path().join("small"),
+        1 << 30,
+        src,
+        Options::default().memory_cap(small),
+    )
+    .unwrap();
+    read_all(&capped);
+    assert!(capped.memory().1 <= small);
+}
+
+#[test]
+fn keeping_a_whole_index_holds_nothing_in_memory_at_a_zero_cap() {
+    let w = World::new();
+    let src = Library::http_source(&w.server.addr).unwrap();
+    let lib = Library::open_with_options(
+        &w.dir.path().join("k"),
+        1 << 30,
+        src,
+        Options::default().memory_cap(0),
+    )
+    .unwrap();
+    let ix = lib.index("things").unwrap();
+    let r = lib.keep_offline(&ix).unwrap();
+    assert!(r.fetched > 0);
+    assert_eq!(lib.memory(), (0, 0));
+    assert_eq!(lib.plan_keep(&ix).unwrap().missing, 0);
+    // And at the default cap, a keep writes to disk without filling memory
+    // with what it fetched.
+    let lib = w.lib("d");
+    let ix = lib.index("things").unwrap();
+    let before = lib.memory().1;
+    lib.keep_offline(&ix).unwrap();
+    let after = lib.memory().1;
+    assert!(after - before < 1 << 20, "{before} -> {after}");
 }
