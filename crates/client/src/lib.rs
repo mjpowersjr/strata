@@ -113,6 +113,30 @@ struct Kept {
     versions: BTreeMap<String, Manifest>,
 }
 
+/// How a [`Library`] is opened ([`Library::open_with_options`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Options {
+    memory_cap: u64,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            memory_cap: Library::DEFAULT_MEMORY_CAP,
+        }
+    }
+}
+
+impl Options {
+    /// The most decoded objects (bytes) the library keeps in memory for
+    /// reads; 0 keeps none (every read comes from the disk cache or the
+    /// network). Default [`Library::DEFAULT_MEMORY_CAP`].
+    pub fn memory_cap(mut self, bytes: u64) -> Self {
+        self.memory_cap = bytes;
+        self
+    }
+}
+
 pub struct Library {
     root: PathBuf,
     source: Arc<dyn ChunkSource>,
@@ -235,8 +259,23 @@ impl Library {
     /// Kept indexes are pinned here (reading their internal tree nodes from
     /// the cache), so they survive eviction from the first fetch on.
     pub fn open_with(root: &Path, cache_bytes: u64, source: Arc<dyn ChunkSource>) -> Result<Self> {
+        Self::open_with_options(root, cache_bytes, source, Options::default())
+    }
+
+    /// The in-memory cap [`open`](Self::open) and
+    /// [`open_with`](Self::open_with) use (64 MiB).
+    pub const DEFAULT_MEMORY_CAP: u64 = 64 << 20;
+
+    /// Like [`open_with`](Self::open_with), with [`Options`] (the memory
+    /// cap).
+    pub fn open_with_options(
+        root: &Path,
+        cache_bytes: u64,
+        source: Arc<dyn ChunkSource>,
+        options: Options,
+    ) -> Result<Self> {
         std::fs::create_dir_all(root)?;
-        let cache = ChunkCache::open(&root.join("cache"), cache_bytes, 64 << 20)?;
+        let cache = ChunkCache::open(&root.join("cache"), cache_bytes, options.memory_cap)?;
         let lib = Self {
             root: root.to_path_buf(),
             source,
@@ -250,6 +289,24 @@ impl Library {
             let _ = lib.pin_version(name, m);
         }
         Ok(lib)
+    }
+
+    /// Change the in-memory cap (bytes of decoded objects; 0 keeps none),
+    /// dropping the least recently used down to it.
+    pub fn set_memory_cap(&self, bytes: u64) {
+        self.cache.set_memory_cap(bytes);
+    }
+
+    /// The in-memory cap and the decoded bytes held under it now.
+    pub fn memory(&self) -> (u64, u64) {
+        self.cache.memory()
+    }
+
+    /// Drop every decoded object held in memory (the disk cache stays; the
+    /// next reads come from it). An open [`Index`] also holds the tree
+    /// nodes it has read: [`Index::clear_memory`].
+    pub fn clear_memory(&self) {
+        self.cache.clear_memory();
     }
 
     fn load_kept(&self) -> Kept {
@@ -296,8 +353,11 @@ impl Library {
             self.unpin_objs(&objs); // pinned twice
             return;
         }
-        let keep: HashSet<String> = objs.iter().map(|o| o.0.clone()).collect();
-        self.unpin_index_except(name, &keep);
+        // Only a previous version needs the set of what to keep pinned.
+        if self.pinned.lock().unwrap().contains_key(name) {
+            let keep: HashSet<String> = objs.iter().map(|o| o.0.clone()).collect();
+            self.unpin_index_except(name, &keep);
+        }
         self.pinned.lock().unwrap().insert(
             name.to_string(),
             (sha.to_string(), objs.into_iter().map(|o| o.0).collect()),
@@ -691,6 +751,12 @@ impl Index {
     /// Where the rows' files live (a URL prefix; see [`file_url`](Self::file_url)).
     pub fn files_base(&self) -> &str {
         &self.files_base
+    }
+
+    /// Drop the decoded tree nodes this index holds in memory (they're
+    /// read again, through the library's cache, on use).
+    pub fn clear_memory(&self) {
+        self.ix.clear_memory();
     }
 
     /// Records (items) in this version.

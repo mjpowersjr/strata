@@ -866,6 +866,10 @@ impl Reader {
     pub fn reset_counts(&self) {
         self.st.lock().unwrap().counts = Counts::default();
     }
+    /// Drop the decoded nodes held in memory (they're read again on use).
+    pub fn clear_cache(&self) {
+        self.st.lock().unwrap().cache = HashMap::new();
+    }
     /// Fetch a set of nodes in one round trip (those not cached, in parallel).
     fn fetch(&self, hs: &[Hash]) -> Result<Vec<Arc<Node>>> {
         let missing: Vec<Hash> = {
